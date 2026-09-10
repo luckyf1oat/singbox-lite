@@ -688,11 +688,24 @@ _pkg_install() {
                 fi
             done
         else
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-                # 兜底：如果安装失败，强制刷新索引后重试
-                apt-get update -qq >/dev/null 2>&1
-                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-            }
+            # [修复] 静默失败会让用户完全不知道 apt 为什么装不上（容器无镜像源等），
+            # 失败时把最后几行报错暴露出来
+            local apt_log
+            apt_log=$(mktemp /tmp/singboxlite-apt.XXXXXX 2>/dev/null) || apt_log=/dev/null
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >"$apt_log" 2>&1; then
+                rm -f -- "$apt_log"
+                return 0
+            fi
+            # 兜底：如果安装失败，强制刷新索引后重试
+            apt-get update -qq >>"$apt_log" 2>&1
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >>"$apt_log" 2>&1; then
+                rm -f -- "$apt_log"
+                return 0
+            fi
+            _warn "apt-get 安装失败(${pkgs})，输出末尾："
+            tail -n 3 "$apt_log" 2>/dev/null | sed 's/^/        /' >&2
+            rm -f -- "$apt_log"
+            return 1
         fi
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
@@ -1274,6 +1287,80 @@ _release_install_cache() {
     return 0
 }
 
+# 通过 releases/latest 的 302 跳转解析版本 tag。
+# 不消耗 GitHub API 配额（反代出口 IP 共享，未认证 API 容易被限流），也不依赖 jq。
+_http_release_tag() {
+    local repo="${1:-}"
+    [ -n "$repo" ] || return 1
+    curl -fsSI --max-time 15 "https://git.5671234.xyz/https://github.com/${repo}/releases/latest" 2>/dev/null \
+        | tr -d '\r' \
+        | sed -n 's#^[Ll]ocation: .*/releases/tag/\([^/[:space:]]*\).*#\1#p' \
+        | tail -n 1
+}
+
+# 解析 JSON 中的 tag_name：优先 jq，jq 尚未安装时用 sed 兜底。
+# 依赖安装阶段必须先能探测 yq 版本，此时 jq 可能还不存在。
+_json_tag_name() {
+    local json="${1:-}"
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null
+    else
+        printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+    fi
+}
+
+# 从反代下载 jq 官方静态二进制（带 SHA-256 校验）。
+# 兜底场景：容器/精简系统上 apt/apk 源不可用，包管理器装不上 jq。
+_install_jq_static() {
+    command -v jq >/dev/null 2>&1 && return 0
+    local asset
+    case $(uname -m) in
+        x86_64|amd64) asset='jq-linux-amd64' ;;
+        aarch64|arm64) asset='jq-linux-arm64' ;;
+        armv7l|armv7|armhf) asset='jq-linux-armhf' ;;
+        armv6l) asset='jq-linux-armel' ;;
+        i386|i486|i586|i686) asset='jq-linux-i386' ;;
+        *) _warn "jq 静态二进制不支持当前架构: $(uname -m)"; return 1 ;;
+    esac
+    local tag release_base
+    tag=$(_http_release_tag 'jqlang/jq') || tag=""
+    if [[ ! "$tag" =~ ^jq-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        tag=$(_json_tag_name "$(curl -fsSL --max-time 15 https://git.5671234.xyz/https://api.github.com/repos/jqlang/jq/releases/latest 2>/dev/null || true)") || tag=""
+    fi
+    if [[ ! "$tag" =~ ^jq-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        _warn "无法解析 jq 官方 release tag。"
+        return 1
+    fi
+    release_base="https://git.5671234.xyz/https://github.com/jqlang/jq/releases/download/${tag}"
+
+    local jq_bin="${JQ_BINARY:-/usr/local/bin/jq}"
+    local tmp_jq sums_tmp expected_sha actual_sha
+    tmp_jq=$(mktemp /tmp/singboxlite-jq-bin.XXXXXX) || return 1
+    sums_tmp=$(mktemp /tmp/singboxlite-jq-sums.XXXXXX) || { rm -f -- "$tmp_jq"; return 1; }
+    if ! wget -qO "$tmp_jq" "${release_base}/${asset}" \
+        || ! wget -qO "$sums_tmp" "${release_base}/sha256sum.txt"; then
+        rm -f -- "$tmp_jq" "$sums_tmp"
+        _warn "jq 二进制或官方校验文件下载失败。"
+        return 1
+    fi
+    expected_sha=$(awk -v name="$asset" '$2 == name { print tolower($1) }' "$sums_tmp" | head -n 1)
+    actual_sha=$(openssl dgst -sha256 "$tmp_jq" 2>/dev/null | awk '{print tolower($NF)}')
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
+        rm -f -- "$tmp_jq" "$sums_tmp"
+        _warn "jq SHA-256 校验失败，拒绝安装。"
+        return 1
+    fi
+    rm -f -- "$sums_tmp"
+    if ! chmod 755 "$tmp_jq" || ! "$tmp_jq" --version >/dev/null 2>&1 \
+        || ! mv -f "$tmp_jq" "$jq_bin"; then
+        rm -f -- "$tmp_jq"
+        _warn "jq 安装或完整性自检失败。"
+        return 1
+    fi
+    hash -r 2>/dev/null || true
+    return 0
+}
+
 # 安装 yq
 _install_yq() {
     if [ ! -x "$YQ_BINARY" ] || ! "$YQ_BINARY" --version >/dev/null 2>&1; then
@@ -1288,8 +1375,12 @@ _install_yq() {
         esac
         local asset="yq_linux_${arch}"
         local release_json release_tag release_base
-        release_json=$(curl -fsSL --max-time 15 https://git.5671234.xyz/https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
-        release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
+        # 先用 302 跳转解析版本号：不消耗 GitHub API 配额，也不依赖 jq
+        release_tag=$(_http_release_tag 'mikefarah/yq') || release_tag=""
+        if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            release_json=$(curl -fsSL --max-time 15 https://git.5671234.xyz/https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
+            release_tag=$(_json_tag_name "$release_json") || release_tag=""
+        fi
         if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             _error "无法解析 yq 官方 release tag。"
             return 1
@@ -1343,6 +1434,7 @@ export SINGBOX_BIN="/usr/local/bin/sing-box"
 export SINGBOX_FIXED_VERSION="1.13.21"
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
+export JQ_BINARY="/usr/local/bin/jq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
 export RELAY_CONFIG_FILE="${SINGBOX_DIR}/relay.json"
 export CLASH_YAML_FILE="${SINGBOX_DIR}/clash.yaml"
@@ -1434,6 +1526,17 @@ _install_dependencies() {
         }
     fi
     
+    # jq 兜底：容器/精简系统上 apt、apk 源可能不可用（例如 PVE LXC 默认没有可用镜像源），
+    # 此时直接从反代下载 jq 官方静态二进制，避免核心依赖安装整体失败
+    if ! command -v jq &>/dev/null; then
+        _warn "系统包管理器未能安装 jq，改用反代下载 jq 官方静态二进制..."
+        if _install_jq_static; then
+            _success "jq 已通过反代静态二进制安装完成"
+        else
+            _error "jq 静态二进制安装失败。"
+        fi
+    fi
+
     _install_yq
 
     # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
