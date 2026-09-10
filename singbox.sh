@@ -7826,7 +7826,8 @@ _advanced_features() {
     # 如果都不存在，则下载
     if [ ! -f "$script_path" ]; then
         _info "本地未检测到进阶脚本，正在尝试下载..."
-        local download_url="${GITHUB_RAW_BASE}/${script_name}"
+        # 附加时间戳穿透反代/CDN 缓存，避免拿到旧的脚本副本
+        local download_url="${GITHUB_RAW_BASE}/${script_name}?v=$(date +%s)"
         
         if _download_bash_script_atomic "$download_url" "$script_path" "$script_name"; then
             _success "下载成功！"
@@ -7869,7 +7870,8 @@ _xray_features() {
     
     if [ ! -f "$script_path" ]; then
         _info "本地未检测到 Xray 管理脚本，正在尝试下载..."
-        local download_url="${GITHUB_RAW_BASE}/${script_name}"
+        # 附加时间戳穿透反代/CDN 缓存，避免拿到旧的脚本副本
+        local download_url="${GITHUB_RAW_BASE}/${script_name}?v=$(date +%s)"
         if _download_bash_script_atomic "$download_url" "$script_path" "$script_name"; then
             _success "下载成功！"
         else

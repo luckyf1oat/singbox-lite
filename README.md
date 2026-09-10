@@ -48,8 +48,12 @@
 ## 安装与启动
 
 ```bash
-(curl -LfsS https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+(curl -LfsS "https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/main/singbox.sh?v=$(date +%s)" -o /usr/local/bin/sb || wget -q "https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/main/singbox.sh?v=$(date +%s)" -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
+
+> 说明：URL 末尾的 `?v=$(date +%s)` 是**缓存穿透**参数。反代会缓存 raw 文件（`Cache-Control: max-age=14400`，最长 4 小时），
+> 不加这个参数可能下载到旧版本；注意要用上面这种“反代 + 原始完整 GitHub 地址”的长形式，
+> 短形式 `https://git.5671234.xyz/luckyf1oat/singbox-lite/raw/main/singbox.sh` 的 302 跳转**不会保留查询串**，因此无法穿透缓存。
 
 以后直接运行：
 

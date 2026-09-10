@@ -908,7 +908,8 @@ _check_parser() {
         PARSER_BIN="$prod_parser"
     else
         _info "正在下载解析脚本 (${PARSER_NAME})..."
-        local PARSER_URL="${GITHUB_RAW_BASE}/${PARSER_NAME}"
+        # 附加时间戳穿透反代/CDN 缓存，避免拿到旧的脚本副本
+        local PARSER_URL="${GITHUB_RAW_BASE}/${PARSER_NAME}?v=$(date +%s)"
         local parser_tmp
         parser_tmp=$(_make_same_dir_tmp "$prod_parser") || return 1
         if ! timeout 10 wget -qO "$parser_tmp" "$PARSER_URL" \
