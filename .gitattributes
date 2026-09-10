@@ -1,0 +1,4 @@
+# 强制 LF 换行：shell 脚本必须能在 Linux 上直接执行，
+# 避免 Windows 的 core.autocrlf 把 CRLF 写入仓库（会导致 bash: /usr/bin/env: 坏解释器等报错）。
+* text=auto eol=lf
+*.sh text eol=lf
