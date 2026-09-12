@@ -2,9 +2,9 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v28`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v29`（`rootless` 分支，新增无 root 模式）、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。`main` 分支仍为 `singbox.sh v28`。
 
-> 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
+> 以 root 运行时与原版行为完全一致（systemd/openrc 自启、nftables 转发、系统校时）；以普通用户运行时自动进入无 root 模式，详见下文。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
 ## 项目组成
 
@@ -54,6 +54,32 @@
 > 说明：URL 末尾的 `?v=$(date +%s)` 是**缓存穿透**参数。反代会缓存 raw 文件（`Cache-Control: max-age=14400`，最长 4 小时），
 > 不加这个参数可能下载到旧版本；注意要用上面这种“反代 + 原始完整 GitHub 地址”的长形式，
 > 短形式 `https://git.5671234.xyz/luckyf1oat/singbox-lite/raw/main/singbox.sh` 的 302 跳转**不会保留查询串**，因此无法穿透缓存。
+
+### 无 root 模式（普通用户运行）
+
+同一个脚本会自动识别运行身份：以 `root` 运行时行为与之前完全一致；以**普通用户**运行时自动进入无 root 模式，不需要任何额外参数。
+
+```bash
+# 普通用户（无需 sudo），安装到 ~/.local/bin/sb
+mkdir -p ~/.local/bin
+(curl -LfsS "https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/rootless/singbox.sh?v=$(date +%s)" -o ~/.local/bin/sb || wget -q "https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/rootless/singbox.sh?v=$(date +%s)" -O ~/.local/bin/sb) && chmod +x ~/.local/bin/sb
+export PATH="$HOME/.local/bin:$PATH"   # 建议加入 ~/.bashrc
+sb
+```
+
+> 无 root 支持位于 `rootless` 分支，`main` 分支保持原有 root 版本不变。子脚本（`advanced_relay.sh`、`xray_manager.sh`、`parser.sh`）会自动从同一 `rootless` 分支下载；也可以手动把四个文件放在 `sb` 同目录（脚本优先使用同目录副本，不再联网下载）。
+
+无 root 模式与 root 模式的差异：
+
+| 项目 | 说明 |
+| --- | --- |
+| 状态目录 | 全部落在 `${SINGBOX_PREFIX}`（默认 `~/.singbox-lite`）：`etc/` 放配置、`bin/` 放核心与 jq/yq、`logs/` 放日志、`run/` 放 PID |
+| 服务方式 | 固定使用 `direct` 模式（`nohup` 后台常驻 + PID 文件），不创建 systemd/openrc 服务，因此开机不会自启 |
+| 依赖安装 | 不再调用 `apt`/`apk`/`yum`，jq 与 yq 直接由反代下载官方静态二进制 |
+| 监听端口 | 内核默认禁止普通用户绑定 1024 以下端口，请使用 `8443`、`2087` 等高端口；低于该阈值时创建节点会被直接拦截并提示。如确需 443，先执行一次 `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443` |
+| nftables | 自动禁用（普通用户没有 `NET_ADMIN`），端口跳跃、端口转发等依赖 nftables 的功能会降级或提示不可用 |
+| 系统校时 | 跳过，只读取系统时间，不写系统时钟 |
+| 换目录 | 想放到别处：`SINGBOX_PREFIX=/data/sb sb` |
 
 以后直接运行：
 

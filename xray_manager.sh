@@ -8,15 +8,41 @@ XRAY_SCRIPT_VERSION="3.1.3"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_DIR="/usr/local/etc/xray"
+# 无 root (rootless) 模式：与 singbox.sh 保持一致，全部落在 ${SINGBOX_PREFIX}。
+if [ "$(id -u)" -ne 0 ]; then
+    SINGBOX_ROOTLESS=1
+    if [ -z "${HOME:-}" ]; then
+        HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    fi
+    : "${SINGBOX_PREFIX:=${HOME:-$PWD}/.singbox-lite}"
+fi
+export SINGBOX_ROOTLESS="${SINGBOX_ROOTLESS:-0}"
+if [ "${SINGBOX_ROOTLESS}" = "1" ]; then
+    export SINGBOX_PREFIX
+    XRAY_BIN="${XRAY_BIN:-${SINGBOX_PREFIX}/bin/xray}"
+    XRAY_DIR="${XRAY_DIR:-${SINGBOX_PREFIX}/xray}"
+    XRAY_RUN_DIR="${XRAY_RUN_DIR:-${SINGBOX_PREFIX}/run}"
+    YQ_BINARY="${YQ_BINARY:-${SINGBOX_PREFIX}/bin/yq}"
+    LOG_DIR="${LOG_DIR:-${SINGBOX_PREFIX}/logs}"
+    export PATH="${SINGBOX_PREFIX}/bin:${HOME}/.local/bin:${PATH}"
+else
+    XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+    XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+    XRAY_RUN_DIR="${XRAY_RUN_DIR:-/run/singboxlite}"
+    YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
+    LOG_DIR="${LOG_DIR:-/var/log}"
+fi
+export XRAY_BIN XRAY_DIR XRAY_RUN_DIR YQ_BINARY LOG_DIR
 XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_METADATA="${XRAY_DIR}/metadata.json"
-XRAY_RUN_DIR="/run/singboxlite"
 XRAY_PID_FILE="${XRAY_RUN_DIR}/xray.pid"
 
 # 共享路径 (继承自 singbox.sh 或使用默认值)
-SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+if [ "${SINGBOX_ROOTLESS}" = "1" ]; then
+    SINGBOX_DIR="${SINGBOX_DIR:-${SINGBOX_PREFIX}/etc}"
+else
+    SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+fi
 CLASH_YAML_FILE="${CLASH_YAML_FILE:-${SINGBOX_DIR}/clash.yaml}"
 YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
 SINGBOXLITE_LOCK_FILE="${SINGBOX_DIR}/.singboxlite.lock"
@@ -124,6 +150,11 @@ fi
 # --- 环境检测 ---
 if ! declare -f _detect_init_system >/dev/null 2>&1; then
     _detect_init_system() {
+        # 无 root 模式无法写 /etc/systemd 或 /etc/init.d，固定使用 direct(nohup) 常驻。
+        if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+            INIT_SYSTEM="direct"
+            return 0
+        fi
         if [ -f /sbin/openrc-run ] || command -v rc-service >/dev/null; then
             INIT_SYSTEM="openrc"
         elif command -v systemctl >/dev/null && [ -d /run/systemd/system ]; then
@@ -133,7 +164,11 @@ if ! declare -f _detect_init_system >/dev/null 2>&1; then
         fi
     }
 fi
-[ -z "$INIT_SYSTEM" ] && _detect_init_system
+if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+    INIT_SYSTEM="direct"
+else
+    [ -z "$INIT_SYSTEM" ] && _detect_init_system
+fi
 
 # 与主脚本使用相同的 Go 运行时软内存限制。独立运行 Xray 管理器时，
 # 本地计算有效内存；由 singbox.sh 调用时直接复用主脚本实现。
@@ -607,8 +642,8 @@ _create_xray_service() {
     elif [ "$INIT_SYSTEM" == "direct" ]; then
         mkdir -p "$XRAY_RUN_DIR"
         chmod 700 "$XRAY_RUN_DIR"
-        touch /var/log/xray.log 2>/dev/null || true
-        chmod 600 /var/log/xray.log 2>/dev/null || true
+        touch ${XRAY_LOG_FILE} 2>/dev/null || true
+        chmod 600 ${XRAY_LOG_FILE} 2>/dev/null || true
     fi
 }
 
@@ -637,7 +672,7 @@ _manage_xray_service() {
         rc-service xray "$action" 2>/dev/null 8>&- 9>&- 219>&- || rc=$?
     elif [ "$INIT_SYSTEM" == "direct" ]; then
         local pid_file="$XRAY_PID_FILE"
-        local log_file="/var/log/xray.log"
+        local log_file="${XRAY_LOG_FILE}"
         case "$action" in
             start)
                 if _xray_is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
@@ -802,7 +837,7 @@ _view_xray_log() {
         _warn "OpenRC 环境下请查看 /var/log/messages"
         tail -f /var/log/messages 2>/dev/null | grep -i xray
     else
-        tail -n 50 -f /var/log/xray.log 2>/dev/null
+        tail -n 50 -f ${XRAY_LOG_FILE} 2>/dev/null
     fi
 }
 

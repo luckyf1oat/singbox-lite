@@ -9,8 +9,35 @@ umask 077
 
 # 核心环境定义
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_BIN="/usr/local/bin/sing-box"
+
+# --- 无 root (rootless) 模式判定：与 singbox.sh 保持一致 ---
+# 被主脚本调用时继承其导出的路径变量；独立执行且非 root 时按前缀自动派生。
+if [ "$(id -u)" -ne 0 ]; then
+    SINGBOX_ROOTLESS=1
+    if [ -z "${HOME:-}" ]; then
+        HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    fi
+    : "${SINGBOX_PREFIX:=${HOME:-$PWD}/.singbox-lite}"
+fi
+export SINGBOX_ROOTLESS="${SINGBOX_ROOTLESS:-0}"
+if [ "${SINGBOX_ROOTLESS}" = "1" ]; then
+    export SINGBOX_PREFIX
+    SINGBOX_DIR="${SINGBOX_DIR:-${SINGBOX_PREFIX}/etc}"
+    SINGBOX_BIN="${SINGBOX_BIN:-${SINGBOX_PREFIX}/bin/sing-box}"
+    XRAY_DIR="${XRAY_DIR:-${SINGBOX_PREFIX}/xray}"
+    YQ_BINARY="${YQ_BINARY:-${SINGBOX_PREFIX}/bin/yq}"
+    RUN_DIR="${RUN_DIR:-${SINGBOX_PREFIX}/run}"
+    LOG_DIR="${LOG_DIR:-${SINGBOX_PREFIX}/logs}"
+    export PATH="${SINGBOX_PREFIX}/bin:${HOME}/.local/bin:${PATH}"
+else
+    SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+    SINGBOX_BIN="${SINGBOX_BIN:-/usr/local/bin/sing-box}"
+    XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+    YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
+    RUN_DIR="${RUN_DIR:-/run/singboxlite}"
+    LOG_DIR="${LOG_DIR:-/var/log}"
+fi
+export SINGBOX_DIR SINGBOX_BIN XRAY_DIR YQ_BINARY RUN_DIR LOG_DIR
 GITHUB_RAW_BASE="https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/main"
 
 # [整合方案] 检测父进程导出的工具函数
@@ -46,8 +73,8 @@ if ! declare -f _info >/dev/null; then
 fi
 
 # --- 全局变量 ---
-# 工具路径
-YQ_BINARY="/usr/local/bin/yq"
+# 工具路径（无 root 模式下由上方模式判定指向 ${SINGBOX_PREFIX}/bin）
+YQ_BINARY="${YQ_BINARY:-/usr/local/bin/yq}"
 
 # 配置文件路径
 MAIN_CONFIG_FILE="${SINGBOX_DIR}/config.json"
@@ -56,7 +83,7 @@ RELAY_AUX_DIR="${SINGBOX_DIR}"
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
 RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
 STATE_LOCK_FILE="${SINGBOX_DIR}/.singboxlite.lock"
-RUN_DIR="/run/singboxlite"
+RUN_DIR="${RUN_DIR:-/run/singboxlite}"
 SINGBOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 STATE_LOCK_FD=""
 STATE_LOCK_OWNED="false"
@@ -344,7 +371,7 @@ _port_conflict() {
     _check_port_occupied "$port" "$proto" && return 0
     _json_config_port_conflict "$MAIN_CONFIG_FILE" "$port" "$proto" "$exclude_tag" && return 0
     _json_config_port_conflict "$RELAY_CONFIG_FILE" "$port" "$proto" "$exclude_tag" && return 0
-    _json_config_port_conflict "/usr/local/etc/xray/config.json" "$port" "$proto" "$exclude_tag" && return 0
+    _json_config_port_conflict "${XRAY_DIR}/config.json" "$port" "$proto" "$exclude_tag" && return 0
     _metadata_port_conflict "$port" "$proto" && return 0
     return 1
 }
@@ -685,7 +712,7 @@ _manage_service() {
         direct)
             _prepare_run_dir || return 1
             local pid_file="$SINGBOX_PID_FILE"
-            local log_file="/var/log/sing-box.log"
+            local log_file="${LOG_FILE:-${LOG_DIR}/sing-box.log}"
             case "$action" in
                 start)
                     if _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"; then
@@ -1128,8 +1155,8 @@ _landing_config() {
     # 获取本机IP，作为备选
     local server_ip=$(_get_public_ip)
     # 使用主脚本中定义的全局 YQ_BINARY 和路径常量
-    local MAIN_CLASH_YAML="/usr/local/etc/sing-box/clash.yaml"
-    local METADATA_FILE="/usr/local/etc/sing-box/metadata.json"
+    local MAIN_CLASH_YAML="${SINGBOX_DIR}/clash.yaml"
+    local METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 
     # 获取所有有效的落地节点 (排除 tag 为 direct 的 outbound，获取所有 inbounds)
     local nodes=$(jq -c '.inbounds[] | select(.tag != "direct")' "$MAIN_CONFIG_FILE")

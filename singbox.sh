@@ -6,16 +6,53 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="28"
+export SCRIPT_VERSION="29"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
-SINGBOX_DIR="/usr/local/etc/sing-box"
+
+# --- 运行模式: root / 无 root (rootless) ---
+# root 运行时行为与上游完全一致；普通用户运行时自动进入无 root 模式：
+# 配置、日志、二进制、PID 全部落在 ${SINGBOX_PREFIX}（默认 ~/.singbox-lite），
+# 服务以 nohup 常驻，不调用 apt / systemd / nftables，端口需使用 1024 以上。
+if [ "$(id -u)" -ne 0 ]; then
+    SINGBOX_ROOTLESS=1
+    if [ -z "${HOME:-}" ]; then
+        HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    fi
+    : "${SINGBOX_PREFIX:=${HOME:-$PWD}/.singbox-lite}"
+else
+    SINGBOX_ROOTLESS="${SINGBOX_ROOTLESS:-0}"
+fi
+export SINGBOX_ROOTLESS
+if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+    export SINGBOX_PREFIX
+    SINGBOX_DIR="${SINGBOX_DIR:-${SINGBOX_PREFIX}/etc}"
+    SINGBOX_BIN_DIR="${SINGBOX_BIN_DIR:-${SINGBOX_PREFIX}/bin}"
+    SINGBOX_LOG_DIR="${SINGBOX_LOG_DIR:-${SINGBOX_PREFIX}/logs}"
+    SINGBOX_RUNTIME_DIR="${SINGBOX_RUNTIME_DIR:-${SINGBOX_PREFIX}/run}"
+    XRAY_DIR="${XRAY_DIR:-${SINGBOX_PREFIX}/xray}"
+    export PATH="${SINGBOX_BIN_DIR}:${HOME}/.local/bin:${PATH}"
+    # jq 优先复用系统已有版本；缺失时才下载静态二进制到 ${SINGBOX_BIN_DIR}（已排在 PATH 首位）。
+    if command -v jq >/dev/null 2>&1; then
+        JQ_BINARY="${JQ_BINARY:-$(command -v jq)}"
+    else
+        JQ_BINARY="${JQ_BINARY:-${SINGBOX_BIN_DIR}/jq}"
+    fi
+    export JQ_BINARY
+else
+    SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+    SINGBOX_BIN_DIR="${SINGBOX_BIN_DIR:-/usr/local/bin}"
+    SINGBOX_LOG_DIR="${SINGBOX_LOG_DIR:-/var/log}"
+    SINGBOX_RUNTIME_DIR="${SINGBOX_RUNTIME_DIR:-/run/singboxlite}"
+    XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+fi
+export SINGBOX_DIR SINGBOX_BIN_DIR SINGBOX_LOG_DIR SINGBOX_RUNTIME_DIR XRAY_DIR
 SINGBOX_FIXED_VERSION="1.13.21"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-GITHUB_RAW_BASE="https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/main"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://git.5671234.xyz/https://raw.githubusercontent.com/luckyf1oat/singbox-lite/rootless}"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # GitHub 反代根地址：斜杠后直接拼接原始 GitHub 地址即可访问。
@@ -101,18 +138,23 @@ _secure_state_permissions() {
     for path in \
         "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" \
         "${SINGBOX_DIR}/relay.json" "${SINGBOX_DIR}/relay_links.json" \
-        "${SINGBOX_DIR}/relay_pf.json" "$SINGBOX_CORE_LOCK_FILE" "/usr/local/etc/xray/config.json" \
-        "/usr/local/etc/xray/metadata.json"; do
+        "${SINGBOX_DIR}/relay_pf.json" "$SINGBOX_CORE_LOCK_FILE" "${XRAY_DIR}/config.json" \
+        "${XRAY_DIR}/metadata.json"; do
         [ -f "$path" ] && chmod 600 "$path" 2>/dev/null || true
     done
-    for path in "$SINGBOX_DIR"/*.key /usr/local/etc/xray/*.key; do
+    for path in "$SINGBOX_DIR"/*.key "${XRAY_DIR}"/*.key; do
         [ -f "$path" ] && chmod 600 "$path" 2>/dev/null || true
     done
 }
 
-# 检查 root 权限
+# 检查 root 权限：非 root 时自动降级为无 root 模式，不再中断执行。
 _check_root() {
-    if [[ $EUID -ne 0 ]]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+            _warn "无 root 模式：状态目录 ${SINGBOX_PREFIX}，服务以 nohup 常驻。"
+            _warn "nftables 转发与系统校时不可用；监听端口需使用 1024 以上（如 8443/2087）。"
+            return 0
+        fi
         _error "此脚本必须以 root 权限运行。"
         exit 1
     fi
@@ -205,6 +247,12 @@ _get_ip() { _get_public_ip; } # 别名兼容
 
 # 系统环境检测
 _detect_init_system() {
+    # 无 root 模式无法写 /etc/systemd 或 /etc/init.d，固定使用 direct(nohup) 常驻。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+        export INIT_SYSTEM="direct"
+        export SERVICE_FILE=""
+        return 0
+    fi
     if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
         export INIT_SYSTEM="openrc"
         export SERVICE_FILE="/etc/init.d/sing-box"
@@ -300,7 +348,7 @@ _check_port_in_singbox_file() {
 
 _check_port_in_xray_config() {
     local port="$1" proto="${2:-tcp}"
-    local xray_config="/usr/local/etc/xray/config.json"
+    local xray_config="${XRAY_DIR}/config.json"
     [ -s "$xray_config" ] || return 1
     jq -e --argjson port "$port" --arg proto "$proto" '
         def transports:
@@ -340,6 +388,22 @@ _check_port_conflict() {
     if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         [ "$silent" != "true" ] && _error "端口 ${port} 无效，应为 1-65535。"
         return 0
+    fi
+
+    # 无 root 模式：内核默认禁止普通用户绑定 ip_unprivileged_port_start 以下的端口，
+    # 在节点创建阶段就拦下来，避免生成出客户端必然连不上的链接。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ] && [ "$(id -u)" -ne 0 ]; then
+        local min_priv_port
+        min_priv_port=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)
+        [[ "$min_priv_port" =~ ^[0-9]+$ ]] || min_priv_port=1024
+        if [ "$min_priv_port" -gt 1 ] && [ "$port" -lt "$min_priv_port" ]; then
+            [ "$silent" != "true" ] && {
+                _error "端口 ${port} 低于 ${min_priv_port}：无 root 模式下内核禁止绑定该端口。"
+                _warning "请改用 8443 / 2087 等 >= ${min_priv_port} 的高端口；如需保留低端口，"
+                _warning "请先执行一次: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=${port}"
+            }
+            return 0
+        fi
     fi
 
     local protocols=""
@@ -497,6 +561,10 @@ _nft_port_expr() {
 }
 
 _nft_apply_redirect_rule() {
+    # 无 root 模式没有写 nftables 的权限，直接失败，由调用方降级处理。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ] || [ "$(id -u)" -ne 0 ]; then
+        return 1
+    fi
     local action="$1" start_port="$2" end_port="$3" target_port="$4" comment="$5"
     if [ "${MAIN_CREATE_TX_ACTIVE:-0}" = "1" ] && [ "${MAIN_CREATE_TX_NFT_SNAPSHOT_AVAILABLE:-0}" != "1" ]; then
         return 1
@@ -512,6 +580,10 @@ _nft_apply_redirect_rule() {
 }
 
 _nft_can_redirect() {
+    # 无 root 模式没有 NET_ADMIN/写 nftables 的权限，直接判定不可用。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ] || [ "$(id -u)" -ne 0 ]; then
+        return 1
+    fi
     local test_port="${1:-65530}" target_port="${2:-65531}" comment="singboxlite-test-redirect-$$"
     _nft_apply_redirect_rule add "$test_port" "$test_port" "$target_port" "$comment" || return 1
     _nft_apply_redirect_rule delete "$test_port" "$test_port" "$target_port" "$comment" || return 1
@@ -519,6 +591,10 @@ _nft_can_redirect() {
 }
 
 _save_nftables_rules() {
+    # 无 root 模式不写 /etc/nftables.d，直接跳过持久化。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ] || [ "$(id -u)" -ne 0 ]; then
+        return 0
+    fi
     command -v nft &>/dev/null || return 0
     mkdir -p /etc/nftables.d || return 1
     local persist_tmp
@@ -664,6 +740,11 @@ _manage_service() {
 _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
+    # 无 root 模式没有系统写入权限，统一由反代下载的静态二进制兜底。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ] || [ "$(id -u)" -ne 0 ]; then
+        _info "无 root 模式：跳过系统包安装 (${pkgs})，改用反代静态二进制。" >&2
+        return 1
+    fi
     if command -v apk &>/dev/null; then
         apk add --no-cache $pkgs >/dev/null 2>&1
     elif command -v apt-get &>/dev/null; then
@@ -1158,7 +1239,7 @@ _is_protected_yaml_name() {
     if [ -s "$ARGO_METADATA_FILE" ] && jq -e --arg name "$name" 'to_entries[]? | select(.value.name == $name)' "$ARGO_METADATA_FILE" >/dev/null 2>&1; then
         return 0
     fi
-    if [ -s "/usr/local/etc/xray/metadata.json" ] && jq -e --arg name "$name" 'to_entries[]? | select(.value.name == $name)' /usr/local/etc/xray/metadata.json >/dev/null 2>&1; then
+    if [ -s "${XRAY_DIR}/metadata.json" ] && jq -e --arg name "$name" 'to_entries[]? | select(.value.name == $name)' ${XRAY_DIR}/metadata.json >/dev/null 2>&1; then
         return 0
     fi
     if [ -s "${SINGBOX_DIR}/relay_links.json" ] && jq -e --arg name "$name" 'to_entries[]? | select(.value.node_name == $name)' "${SINGBOX_DIR}/relay_links.json" >/dev/null 2>&1; then
@@ -1171,7 +1252,7 @@ _validate_protected_yaml_metadata() {
     local metadata_path
     for metadata_path in \
         "$ARGO_METADATA_FILE" \
-        "/usr/local/etc/xray/metadata.json" \
+        "${XRAY_DIR}/metadata.json" \
         "${SINGBOX_DIR}/relay_links.json"; do
         [ -e "$metadata_path" ] || continue
         if [ ! -f "$metadata_path" ] || [ ! -s "$metadata_path" ] \
@@ -1334,6 +1415,8 @@ _install_jq_static() {
     release_base="https://git.5671234.xyz/https://github.com/jqlang/jq/releases/download/${tag}"
 
     local jq_bin="${JQ_BINARY:-/usr/local/bin/jq}"
+    # 无 root 模式下目标目录是 ${SINGBOX_PREFIX}/bin，首次安装需要自建目录。
+    mkdir -p "$(dirname "$jq_bin")" 2>/dev/null || true
     local tmp_jq sums_tmp expected_sha actual_sha
     tmp_jq=$(mktemp /tmp/singboxlite-jq-bin.XXXXXX) || return 1
     sums_tmp=$(mktemp /tmp/singboxlite-jq-sums.XXXXXX) || { rm -f -- "$tmp_jq"; return 1; }
@@ -1365,6 +1448,8 @@ _install_jq_static() {
 _install_yq() {
     if [ ! -x "$YQ_BINARY" ] || ! "$YQ_BINARY" --version >/dev/null 2>&1; then
         _info "安装 yq..."
+        # 无 root 模式下目标目录是 ${SINGBOX_PREFIX}/bin，首次安装需要自建目录。
+        mkdir -p "$(dirname "$YQ_BINARY")" 2>/dev/null || true
         local arch
         arch=$(uname -m)
         case $arch in
@@ -1429,32 +1514,46 @@ _install_yq() {
 }
 
 # --- 核心变量定义 ---
-export SINGBOX_DIR="/usr/local/etc/sing-box"
-export SINGBOX_BIN="/usr/local/bin/sing-box"
-export SINGBOX_FIXED_VERSION="1.13.21"
-export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-export YQ_BINARY="/usr/local/bin/yq"
-export JQ_BINARY="/usr/local/bin/jq"
-export CONFIG_FILE="${SINGBOX_DIR}/config.json"
-export RELAY_CONFIG_FILE="${SINGBOX_DIR}/relay.json"
-export CLASH_YAML_FILE="${SINGBOX_DIR}/clash.yaml"
-export METADATA_FILE="${SINGBOX_DIR}/metadata.json"
-export ARGO_METADATA_FILE="${SINGBOX_DIR}/argo_metadata.json"
-export LOG_FILE="/var/log/sing-box.log"
-export ARGO_LOG_FILE="/var/log/singbox_argo.log"
-export RUNTIME_DIR="/run/singboxlite"
-export PID_FILE="${RUNTIME_DIR}/sing-box.pid"
-export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-export XRAY_RUNTIME_DIR="${RUNTIME_DIR}"
-export XRAY_PID_FILE="${XRAY_RUNTIME_DIR}/xray.pid"
-export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
+# 无 root 模式下全部路径派生自 ${SINGBOX_PREFIX}；root 模式保持上游路径不变。
+export SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+export SINGBOX_BIN_DIR="${SINGBOX_BIN_DIR:-/usr/local/bin}"
+export SINGBOX_LOG_DIR="${SINGBOX_LOG_DIR:-/var/log}"
+export SINGBOX_RUNTIME_DIR="${SINGBOX_RUNTIME_DIR:-/run/singboxlite}"
+export XRAY_DIR="${XRAY_DIR:-/usr/local/etc/xray}"
+export SINGBOX_BIN="${SINGBOX_BIN:-${SINGBOX_BIN_DIR}/sing-box}"
+export SINGBOX_FIXED_VERSION="${SINGBOX_FIXED_VERSION:-1.13.21}"
+export SINGBOX_CORE_LOCK_FILE="${SINGBOX_CORE_LOCK_FILE:-${SINGBOX_DIR}/core-version.lock}"
+export YQ_BINARY="${YQ_BINARY:-${SINGBOX_BIN_DIR}/yq}"
+export JQ_BINARY="${JQ_BINARY:-${SINGBOX_BIN_DIR}/jq}"
+export CONFIG_FILE="${CONFIG_FILE:-${SINGBOX_DIR}/config.json}"
+export RELAY_CONFIG_FILE="${RELAY_CONFIG_FILE:-${SINGBOX_DIR}/relay.json}"
+export CLASH_YAML_FILE="${CLASH_YAML_FILE:-${SINGBOX_DIR}/clash.yaml}"
+export METADATA_FILE="${METADATA_FILE:-${SINGBOX_DIR}/metadata.json}"
+export ARGO_METADATA_FILE="${ARGO_METADATA_FILE:-${SINGBOX_DIR}/argo_metadata.json}"
+export LOG_DIR="${LOG_DIR:-${SINGBOX_LOG_DIR}}"
+export LOG_FILE="${LOG_FILE:-${SINGBOX_LOG_DIR}/sing-box.log}"
+export ARGO_LOG_FILE="${ARGO_LOG_FILE:-${SINGBOX_LOG_DIR}/singbox_argo.log}"
+export XRAY_LOG_FILE="${XRAY_LOG_FILE:-${SINGBOX_LOG_DIR}/xray.log}"
+export RUNTIME_DIR="${RUNTIME_DIR:-${SINGBOX_RUNTIME_DIR}}"
+export PID_FILE="${PID_FILE:-${RUNTIME_DIR}/sing-box.pid}"
+export CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-${SINGBOX_BIN_DIR}/cloudflared}"
+export XRAY_BIN="${XRAY_BIN:-${SINGBOX_BIN_DIR}/xray}"
+export XRAY_RUNTIME_DIR="${XRAY_RUNTIME_DIR:-${RUNTIME_DIR}}"
+export XRAY_PID_FILE="${XRAY_PID_FILE:-${XRAY_RUNTIME_DIR}/xray.pid}"
+export DEP_STATE_FILE="${DEP_STATE_FILE:-${SINGBOX_DIR}/dependencies.ok}"
 export DEP_STATE_VERSION="20260831-lowmem-1"
-_detect_init_system
-case "$INIT_SYSTEM" in
-    openrc) export SERVICE_FILE="/etc/init.d/sing-box" ;;
-    systemd) export SERVICE_FILE="/etc/systemd/system/sing-box.service" ;;
-    *) export SERVICE_FILE="" ;;
-esac
+if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+    # 无 root 模式固定使用 direct(nohup) 常驻，不生成 systemd/openrc 服务文件。
+    export INIT_SYSTEM="direct"
+    export SERVICE_FILE=""
+else
+    _detect_init_system
+    case "$INIT_SYSTEM" in
+        openrc) export SERVICE_FILE="/etc/init.d/sing-box" ;;
+        systemd) export SERVICE_FILE="/etc/systemd/system/sing-box.service" ;;
+        *) export SERVICE_FILE="" ;;
+    esac
+fi
 
 export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
 
@@ -1485,6 +1584,34 @@ _install_dependencies() {
         fi
         [ ! -x "$YQ_BINARY" ] && missing_cached="$missing_cached yq"
         _warn "依赖缓存存在，但关键工具缺失:${missing_cached}，将执行一次修复安装。"
+    fi
+
+    # 无 root 模式无法调用系统包管理器：只校验必需命令，缺失项用反代静态二进制兜底。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+        _info "无 root 模式：跳过系统依赖安装，直接校验必需命令。"
+        if ! command -v jq &>/dev/null; then
+            _warn "系统缺少 jq，改用反代下载 jq 官方静态二进制..."
+            if _install_jq_static; then
+                _success "jq 已通过反代静态二进制安装完成"
+            else
+                _error "jq 静态二进制安装失败。"
+            fi
+        fi
+        _install_yq
+
+        local rootless_missing=""
+        for cmd in bash jq curl wget openssl tar unzip flock; do
+            command -v "$cmd" &>/dev/null || rootless_missing="$rootless_missing $cmd"
+        done
+        [ -x "$YQ_BINARY" ] || rootless_missing="$rootless_missing yq"
+        if [ -n "$rootless_missing" ]; then
+            _error "以下关键依赖缺失:${rootless_missing}"
+            _error "无 root 模式无法安装系统软件包（jq/yq 除外），请联系管理员安装后重试。"
+            exit 1
+        fi
+        mkdir -p "$SINGBOX_DIR"
+        printf '%s\n' "$DEP_STATE_VERSION" > "$DEP_STATE_FILE"
+        return 0
     fi
 
     # 核心依赖：脚本运行的绝对前提，必须全部装上
@@ -1571,6 +1698,11 @@ _install_dependencies() {
 
 # 确保 nftables 可用，并检测实际 netfilter 写入能力
 _ensure_nftables() {
+    # 无 root 模式没有 NET_ADMIN，直接判定不可用，由调用方降级为用户态转发。
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ] || [ "$(id -u)" -ne 0 ]; then
+        _warn "无 root 模式：nftables 不可用，端口转发将使用 sing-box 用户态引擎代替。"
+        return 2
+    fi
     if ! command -v nft &>/dev/null; then
         _info "未检测到 nftables，尝试安装..."
         _pkg_install nftables
@@ -1902,7 +2034,7 @@ _argo_pid_file() {
 _argo_log_file() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
-    printf '/var/log/singbox_argo_%s.log\n' "$port"
+    printf '%s/singbox_argo_%s.log\n' "${SINGBOX_LOG_DIR:-/var/log}" "$port"
 }
 
 _migrate_legacy_argo_state() {
@@ -3015,7 +3147,7 @@ _uninstall_argo() {
     _stop_all_argo_tunnels 2>/dev/null
     
     # 删除所有 PID/LOG 文件；旧 /tmp PID 已由 _stop_all_argo_tunnels 校验后处理。
-    rm -f "$RUNTIME_DIR"/argo-*.pid /var/log/singbox_argo_*.log
+    rm -f "$RUNTIME_DIR"/argo-*.pid "${SINGBOX_LOG_DIR}"/singbox_argo_*.log
     rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
     rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
     rm -rf "/etc/cloudflared"
@@ -3223,7 +3355,13 @@ EOF
 }
 
 _create_service_files() {
-    
+    if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+        # 无 root 模式不写 /etc/systemd、/etc/init.d，直接使用 direct(nohup) 常驻。
+        mkdir -p "${SINGBOX_LOG_DIR}" "${SINGBOX_BIN_DIR}" "${SINGBOX_DIR}" 2>/dev/null || true
+        touch "$LOG_FILE" 2>/dev/null || true
+        _info "无 root 模式：跳过系统服务创建，sing-box 将以 direct 后台(nohup)模式运行。"
+        return 0
+    fi
     _info "正在创建 ${INIT_SYSTEM} 服务文件..."
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         _create_systemd_service
@@ -3255,7 +3393,7 @@ _cleanup_runtime_logs() {
     [ $((now - last)) -lt 172800 ] && return 0
 
     local log
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE" /var/log/xray.log /var/log/singbox_argo_*.log; do
+    for log in "$LOG_FILE" "$ARGO_LOG_FILE" "${XRAY_LOG_FILE}" "${SINGBOX_LOG_DIR}"/singbox_argo_*.log; do
         [ -f "$log" ] && : > "$log"
     done
     printf '%s\n' "$now" > "$state_file"
@@ -3303,6 +3441,10 @@ _view_log() {
 }
 
 _remove_scheduled_restart_components() {
+    # direct / 无 root 模式：清理用户级 crontab 中的定时重启任务
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq 'restart-core'; then
+        crontab -l 2>/dev/null | grep -Fv 'restart-core' | crontab - >/dev/null 2>&1 || true
+    fi
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl disable --now sing-box-restart.timer >/dev/null 2>&1 || true
     fi
@@ -3334,7 +3476,7 @@ _uninstall() {
     echo -e "  ${RED}-${NC} sing-box 二进制: ${SINGBOX_BIN}"
     echo -e "  ${RED}-${NC} yq 二进制: ${YQ_BINARY}"
     [ -f "${CLOUDFLARED_BIN}" ] && echo -e "  ${RED}-${NC} cloudflared 二进制: ${CLOUDFLARED_BIN}"
-    [ -f "/usr/local/bin/xray" ] && echo -e "  ${RED}-${NC} Xray 核心及配置: /usr/local/etc/xray/"
+    [ -f "${XRAY_BIN}" ] && echo -e "  ${RED}-${NC} Xray 核心及配置: ${XRAY_DIR}/"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
@@ -3376,11 +3518,11 @@ _uninstall() {
 
     rm -f "${CLOUDFLARED_BIN}" "$RUNTIME_DIR"/argo-*.pid "$RUNTIME_DIR"/argo-keepalive.lock
     rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${ARGO_LOG_FILE}" /var/log/singbox_argo_*.log
+    rm -f "${ARGO_LOG_FILE}" "${SINGBOX_LOG_DIR}"/singbox_argo_*.log
     rm -rf /etc/cloudflared
 
     # 4. 即使核心文件已部分丢失，也清理残留的 Xray 服务与状态。
-    if [ -f "/usr/local/bin/xray" ] || [ -d "/usr/local/etc/xray" ] \
+    if [ -f "${XRAY_BIN}" ] || [ -d "${XRAY_DIR}" ] \
         || [ -f /etc/systemd/system/xray.service ] || [ -f /etc/init.d/xray ]; then
         _info "正在清理 Xray 核心..."
     fi
@@ -3389,9 +3531,9 @@ _uninstall() {
     fi
     if command -v rc-service >/dev/null 2>&1; then rc-service xray stop >/dev/null 2>&1 || true; fi
     if command -v rc-update >/dev/null 2>&1; then rc-update del xray default >/dev/null 2>&1 || true; fi
-    rm -f /etc/systemd/system/xray.service /etc/init.d/xray /usr/local/bin/xray "$XRAY_PID_FILE"
-    rm -rf /usr/local/etc/xray
-    rm -f /var/log/xray.log
+    rm -f /etc/systemd/system/xray.service /etc/init.d/xray ${XRAY_BIN} "$XRAY_PID_FILE"
+    rm -rf "${XRAY_DIR}"
+    rm -f "${XRAY_LOG_FILE}"
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl reset-failed xray.service >/dev/null 2>&1 || true
@@ -3829,7 +3971,7 @@ _show_node_link() {
             echo -e "      version: 3"
             echo -e "${YELLOW}========================================================${NC}"
             echo -e "${CYAN}[提示] ShadowTLS 需要特定的客户端配置。${NC}"
-            echo -e "${CYAN}您也可以直接打开本机位于 ${YELLOW}/usr/local/etc/sing-box/clash.yaml${CYAN} 的配置文件，${NC}"
+            echo -e "${CYAN}您也可以直接打开本机位于 ${YELLOW}${CLASH_YAML_FILE}${CYAN} 的配置文件，${NC}"
             echo -e "${CYAN}找到对应节点的 YAML 代码块，并复制到您的客户端中使用！${NC}"
             ;;
         "vless-ws")
@@ -7604,7 +7746,7 @@ _do_update_singbox() {
 
 # [安装/更新 Xray 核心] — 双模态：未装就装、已装就更新
 _install_or_update_xray() {
-    local xray_bin="/usr/local/bin/xray"
+    local xray_bin="${XRAY_BIN}"
     if [ -f "$xray_bin" ]; then
         local current_ver=$($xray_bin version 2>/dev/null | head -1 | awk '{print $2}')
         _info "当前 Xray 版本: v${current_ver}，正在检查更新..."
@@ -7617,8 +7759,8 @@ _install_or_update_xray() {
 # 执行 Xray 核心的安装/更新 (内联实现，避免依赖 xray_manager.sh 的 source)
 _do_update_xray() {
     _info "--- 安装/更新 Xray 核心 ---"
-    local xray_bin="/usr/local/bin/xray"
-    local xray_dir="/usr/local/etc/xray"
+    local xray_bin="${XRAY_BIN}"
+    local xray_dir="${XRAY_DIR}"
     local is_first_install=false
     [ ! -f "$xray_bin" ] && is_first_install=true
     command -v unzip &>/dev/null || _pkg_install unzip
@@ -7720,7 +7862,7 @@ _do_update_xray() {
                 _is_pid_running_cmd "$xray_pid" "$xray_bin" && kill "$xray_pid" 2>/dev/null
             fi
             rm -f "$XRAY_PID_FILE"
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
+            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> "${XRAY_LOG_FILE}" 2>&1 8>&- 9>&- 219>&- &
             echo $! > "$XRAY_PID_FILE"
             chmod 600 "$XRAY_PID_FILE" 2>/dev/null || true
             sleep 1
@@ -7736,12 +7878,12 @@ _do_update_xray() {
         if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "openrc" ]; then rc-service xray restart >/dev/null 2>&1 || true; fi
         if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "direct" ]; then
             mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" 2>/dev/null || true
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
+            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> "${XRAY_LOG_FILE}" 2>&1 8>&- 9>&- 219>&- &
             echo $! > "$XRAY_PID_FILE"
             chmod 600 "$XRAY_PID_FILE" 2>/dev/null || true
             sleep 1
             if ! _is_pid_file_running_cmd "$XRAY_PID_FILE" "$xray_bin"; then
-                _error "旧 Xray 核心已恢复，但 direct 模式重新启动失败，请检查 /var/log/xray.log。"
+                _error "旧 Xray 核心已恢复，但 direct 模式重新启动失败，请检查 "${XRAY_LOG_FILE}"。"
                 rm -f "$XRAY_PID_FILE"
             fi
         fi
@@ -7759,8 +7901,8 @@ _do_update_xray() {
 
 # 从主脚本创建 Xray 服务文件 (内联实现)
 _create_xray_service_from_main() {
-    local xray_bin="/usr/local/bin/xray"
-    local xray_dir="/usr/local/etc/xray"
+    local xray_bin="${XRAY_BIN}"
+    local xray_dir="${XRAY_DIR}"
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         if [ ! -f "/etc/systemd/system/xray.service" ]; then
             cat > /etc/systemd/system/xray.service << EOF
@@ -7856,7 +7998,7 @@ _advanced_features() {
 # --- Xray 节点管理 (子脚本) ---
 _xray_features() {
     # 前置检查：Xray 核心必须已安装
-    if [ ! -f "/usr/local/bin/xray" ]; then
+    if [ ! -f "${XRAY_BIN}" ]; then
         _error "Xray 核心未安装！请先通过主菜单【核心管理】-> [16] 进行安装。"
         return 1
     fi
@@ -7992,8 +8134,8 @@ _main_menu() {
         # 获取 Xray 版本和状态
         local xray_version=""
         local xray_status="${RED}○ 未安装${NC}"
-        if [ -f "/usr/local/bin/xray" ]; then
-            xray_version=" v$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')"
+        if [ -f "${XRAY_BIN}" ]; then
+            xray_version=" v$(${XRAY_BIN} version 2>/dev/null | head -1 | awk '{print $2}')"
             if [ "$INIT_SYSTEM" == "systemd" ]; then
                 if systemctl is-active --quiet xray 2>/dev/null; then
                     xray_status="${GREEN}● 运行中${NC}"
@@ -8013,11 +8155,15 @@ _main_menu() {
                     xray_status="${YELLOW}○ 已停止${NC}"
                 fi
             fi
-            local xray_nodes=$(jq '.inbounds | length' /usr/local/etc/xray/config.json 2>/dev/null || echo "0")
+            local xray_nodes=$(jq '.inbounds | length' ${XRAY_DIR}/config.json 2>/dev/null || echo "0")
             xray_status="${xray_status} (${xray_nodes}节点)"
         fi
         
-        echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
+        if [ "${SINGBOX_ROOTLESS:-0}" = "1" ]; then
+            echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}  |  ${YELLOW}无 root: ${SINGBOX_PREFIX}${NC}"
+        else
+            echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
+        fi
         echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}"
         echo -e "  Xray${CYAN}${xray_version}${NC}: ${xray_status}"
         echo ""
@@ -8165,6 +8311,14 @@ _main_menu() {
             cron_time=$(grep "RESTART_TIME=" /etc/init.d/sing-box-timer | cut -d'"' -f2)
             cron_status="已启用 (每天 ${cron_time} 重启 - OpenRC)"
         fi
+    elif [ "$INIT_SYSTEM" == "direct" ]; then
+        # direct / 无 root 模式：用户级 crontab 中的 restart-core 任务
+        local direct_cron_line
+        direct_cron_line=$(crontab -l 2>/dev/null | grep -F 'restart-core' | head -n 1)
+        if [ -n "$direct_cron_line" ]; then
+            cron_time=$(printf '%s\n' "$direct_cron_line" | awk '{printf "%02d:%02d", $2, $1}')
+            cron_status="已启用 (每天 ${cron_time} 重启 - cron)"
+        fi
     fi
     
     echo -e "  ${CYAN}【服务器时间信息】${NC}"
@@ -8250,9 +8404,23 @@ EOF
                 chmod +x /etc/init.d/sing-box-timer
                 rc-service sing-box-timer restart 2>/dev/null
                 rc-update add sing-box-timer default 2>/dev/null
+            elif [ "$INIT_SYSTEM" == "direct" ]; then
+                # direct / 无 root 模式：改用用户级 crontab 执行 restart-core
+                if ! command -v crontab >/dev/null 2>&1; then
+                    _error "未检测到 crontab，${INIT_SYSTEM} 模式下无法设置定时重启。"
+                    return
+                fi
+                local direct_job
+                direct_job="$(printf '%d %d * * *' "$((10#$min))" "$((10#$hour))") bash ${SELF_SCRIPT_PATH} restart-core >/dev/null 2>&1"
+                if { crontab -l 2>/dev/null | grep -Fv 'restart-core'; printf '%s\n' "$direct_job"; } | crontab -; then
+                    _info "已写入用户 crontab: ${direct_job}"
+                else
+                    _error "写入用户 crontab 失败。"
+                    return
+                fi
             fi
             
-            _success "定时重启已通过 ${INIT_SYSTEM} 原生组件设置完成！"
+            _success "定时重启已设置完成（${INIT_SYSTEM}）。"
             echo ""
             echo -e "  重启时间: ${GREEN}每天 ${time_str}${NC} (服务器时区)"
                 
@@ -8285,6 +8453,8 @@ EOF
                 systemctl list-timers sing-box-restart.timer --no-pager
             elif [ "$INIT_SYSTEM" == "openrc" ]; then
                 rc-service sing-box-timer status
+            elif [ "$INIT_SYSTEM" == "direct" ]; then
+                crontab -l 2>/dev/null | grep -F 'restart-core' || _warning "未找到定时重启任务"
             fi
             ;;
         3)
@@ -8888,6 +9058,10 @@ while [[ $# -gt 0 ]]; do
         keepalive)
             _argo_keepalive
             exit 0
+            ;;
+        restart-core)
+            _manage_service restart
+            exit $?
             ;;
         cleanup-logs)
             _cleanup_runtime_logs
