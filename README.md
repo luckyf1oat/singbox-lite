@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v29`（`rootless` 分支，新增无 root 模式）、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。`main` 分支仍为 `singbox.sh v28`。
+当前文档按以下脚本版本整理：`singbox.sh v30`（`rootless` 分支，新增无 root 模式）、`advanced_relay.sh v19`、`xray_manager.sh v3.1.4`。`main` 分支仍为 `singbox.sh v28`。
 
 > 以 root 运行时与原版行为完全一致（systemd/openrc 自启、nftables 转发、系统校时）；以普通用户运行时自动进入无 root 模式，详见下文。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -79,6 +79,7 @@ sb
 | 监听端口 | 内核默认禁止普通用户绑定 1024 以下端口，请使用 `8443`、`2087` 等高端口；低于该阈值时创建节点会被直接拦截并提示。如确需 443，先执行一次 `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443` |
 | nftables | 自动禁用（普通用户没有 `NET_ADMIN`），端口跳跃、端口转发等依赖 nftables 的功能会降级或提示不可用 |
 | 系统校时 | 跳过，只读取系统时间，不写系统时钟 |
+| 可选依赖 | 普通用户装不了系统包，因此**只有启动必需的命令缺失才会报错退出**（`bash`/`tar`/`flock`/`jq`/`yq`/`curl` 或 `wget`）；`unzip`、`openssl`、`socat` 等缺失只在启动时提示受影响的功能，不再阻断运行。其中 Xray 核心解包会自动回退到 `busybox unzip` → `python3 zipfile` → `jar`（JDK 自带），因此**没装 unzip 也能安装 Xray** |
 | 换目录 | 想放到别处：`SINGBOX_PREFIX=/data/sb sb` |
 
 以后直接运行：

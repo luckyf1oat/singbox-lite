@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="29"
+export SCRIPT_VERSION="30"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1570,13 +1570,18 @@ trap _cleanup_main_temp_files EXIT
 _install_dependencies() {
     local force="${1:-false}"
     if [ "$force" != "true" ] && [ -s "$DEP_STATE_FILE" ] && grep -qx "$DEP_STATE_VERSION" "$DEP_STATE_FILE" 2>/dev/null; then
+        # 无 root 模式只把"启动必需"的命令计入缺失：该环境无法安装系统包，
+        # 若把 unzip/openssl/wget 一类可选工具算作缺失，会导致每次启动都
+        # 触发一次注定失败的"修复安装"。
+        local dep_required="bash jq curl wget openssl tar unzip flock"
+        [ "${SINGBOX_ROOTLESS:-0}" = "1" ] && dep_required="bash jq tar flock"
         local missing_cached=""
-        for cmd in bash jq curl wget openssl tar unzip flock; do
+        for cmd in $dep_required; do
             if ! command -v "$cmd" &>/dev/null; then
                 missing_cached="$missing_cached $cmd"
             fi
         done
-        if ! _is_podman_environment && ! command -v nft &>/dev/null; then
+        if [ "${SINGBOX_ROOTLESS:-0}" != "1" ] && ! _is_podman_environment && ! command -v nft &>/dev/null; then
             missing_cached="$missing_cached nftables"
         fi
         if [ -z "$missing_cached" ] && [ -x "$YQ_BINARY" ]; then
@@ -1599,15 +1604,25 @@ _install_dependencies() {
         fi
         _install_yq
 
-        local rootless_missing=""
-        for cmd in bash jq curl wget openssl tar unzip flock; do
+        local rootless_missing="" rootless_soft=""
+        # 必需：缺失则脚本无法正常启动/写入状态（jq/yq 已在上方用静态二进制兜底）
+        for cmd in bash tar flock jq; do
             command -v "$cmd" &>/dev/null || rootless_missing="$rootless_missing $cmd"
         done
+        command -v curl &>/dev/null || command -v wget &>/dev/null || rootless_missing="$rootless_missing curl或wget"
         [ -x "$YQ_BINARY" ] || rootless_missing="$rootless_missing yq"
         if [ -n "$rootless_missing" ]; then
-            _error "以下关键依赖缺失:${rootless_missing}"
+            _error "以下必需命令缺失:${rootless_missing}"
             _error "无 root 模式无法安装系统软件包（jq/yq 除外），请联系管理员安装后重试。"
             exit 1
+        fi
+        # 可选：只提示受影响的功能，不阻断启动（该环境无法自行安装）
+        command -v wget &>/dev/null || rootless_soft="$rootless_soft wget(Xray 等下载路径)"
+        command -v openssl &>/dev/null || rootless_soft="$rootless_soft openssl(自签证书/校验回退)"
+        command -v unzip &>/dev/null || rootless_soft="$rootless_soft unzip(Xray 核心解包)"
+        command -v socat &>/dev/null || rootless_soft="$rootless_soft socat(端口诊断)"
+        if [ -n "$rootless_soft" ]; then
+            _warn "以下可选命令缺失，仅影响对应功能（sing-box 节点创建与运行不受影响）:${rootless_soft}"
         fi
         mkdir -p "$SINGBOX_DIR"
         printf '%s\n' "$DEP_STATE_VERSION" > "$DEP_STATE_FILE"
@@ -7756,6 +7771,74 @@ _install_or_update_xray() {
     _do_update_xray
 }
 
+# --- zip 解包兜底 ---------------------------------------------------------
+# 无 root 环境经常没有 unzip，而 Xray 官方只发 zip 包。这里统一走
+# unzip -> busybox unzip -> python3 zipfile -> jar 的依次回退，
+# 任何一个可用即可完成解包（jar 为 JDK 自带，容器里常见）。
+_zip_tool_available() {
+    command -v unzip &>/dev/null && return 0
+    command -v busybox &>/dev/null && return 0
+    command -v python3 &>/dev/null && return 0
+    command -v jar &>/dev/null && return 0
+    return 1
+}
+
+# 用法：_extract_from_zip <zip路径> <包内成员名> <输出文件>
+_extract_from_zip() {
+    local zip="$1" member="$2" out="$3"
+    [ -f "$zip" ] || return 1
+    if command -v unzip &>/dev/null; then
+        if unzip -p "$zip" "$member" > "$out" 2>/dev/null && [ -s "$out" ]; then
+            return 0
+        fi
+        : > "$out"
+    fi
+    if command -v busybox &>/dev/null; then
+        if busybox unzip -p "$zip" "$member" > "$out" 2>/dev/null && [ -s "$out" ]; then
+            return 0
+        fi
+        : > "$out"
+    fi
+    if command -v python3 &>/dev/null; then
+        python3 -c 'import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z, open(sys.argv[3], "wb") as f:
+    f.write(z.read(sys.argv[2]))' "$zip" "$member" "$out" >/dev/null 2>&1
+        if [ -s "$out" ]; then
+            return 0
+        fi
+        : > "$out"
+    fi
+    if command -v jar &>/dev/null; then
+        local jar_dir
+        jar_dir=$(mktemp -d) || return 1
+        (cd "$jar_dir" && jar xf "$zip" "$member") >/dev/null 2>&1
+        if [ -s "${jar_dir}/${member}" ]; then
+            mv -f "${jar_dir}/${member}" "$out" && rm -rf "$jar_dir" && return 0
+        fi
+        rm -rf "$jar_dir"
+    fi
+    : > "$out"
+    return 1
+}
+
+# zip 完整性自检；若环境完全没有解压工具则跳过（调用方已完成 SHA-256 校验）。
+_zip_integrity_ok() {
+    local zip="$1"
+    if command -v unzip &>/dev/null; then
+        unzip -tq "$zip" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if command -v busybox &>/dev/null; then
+        busybox unzip -l "$zip" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if command -v python3 &>/dev/null; then
+        python3 -c 'import sys, zipfile; sys.exit(0 if zipfile.ZipFile(sys.argv[1]).testzip() is None else 1)' "$zip" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    return 0
+}
+
 # 执行 Xray 核心的安装/更新 (内联实现，避免依赖 xray_manager.sh 的 source)
 _do_update_xray() {
     _info "--- 安装/更新 Xray 核心 ---"
@@ -7763,7 +7846,14 @@ _do_update_xray() {
     local xray_dir="${XRAY_DIR}"
     local is_first_install=false
     [ ! -f "$xray_bin" ] && is_first_install=true
-    command -v unzip &>/dev/null || _pkg_install unzip
+    if ! command -v unzip &>/dev/null; then
+        _pkg_install unzip >/dev/null 2>&1 || true
+    fi
+    if ! _zip_tool_available; then
+        _error "缺少 unzip，且未找到 busybox/python3/jar 等备用解包工具。"
+        _warn "无 root 模式无法自动安装：请联系管理员执行 apt-get install -y unzip（或 yum install -y unzip）。"
+        return 1
+    fi
 
     local arch=$(uname -m)
     local xray_arch=""
@@ -7803,14 +7893,14 @@ _do_update_xray() {
 
     # 只提取运行所需的三个文件，避免完整展开后再复制核心产生双份页缓存。
     # 这对 128MB 一类低内存容器尤为重要。
-    if ! unzip -tq "$tmp_zip" >/dev/null 2>&1 || ! unzip -p "$tmp_zip" xray > "${tmp_dir}/xray"; then
+    if ! _zip_integrity_ok "$tmp_zip" || ! _extract_from_zip "$tmp_zip" xray "${tmp_dir}/xray"; then
         _error "Xray 解压失败！"
         rm -rf "$tmp_dir"
         return 1
     fi
     local geodata_file
     for geodata_file in geoip.dat geosite.dat; do
-        if unzip -p "$tmp_zip" "$geodata_file" > "${tmp_dir}/${geodata_file}" 2>/dev/null; then
+        if _extract_from_zip "$tmp_zip" "$geodata_file" "${tmp_dir}/${geodata_file}"; then
             chmod 600 "${tmp_dir}/${geodata_file}" 2>/dev/null || true
         else
             rm -f -- "${tmp_dir}/${geodata_file}"
